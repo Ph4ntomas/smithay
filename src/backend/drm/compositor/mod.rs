@@ -2303,7 +2303,10 @@ where
                                 self.surface.device_fd(),
                                 config.properties.src,
                                 config.properties.dst,
-                                render_damage.iter().copied(),
+                                render_damage
+                                    .iter()
+                                    .copied()
+                                    .map(|d| output_transform.transform_rect_in(d, &output_geometry.size)),
                             )
                             .ok()
                             .flatten();
