@@ -125,12 +125,7 @@
 //! }
 //! ```
 use std::{
-    collections::HashMap,
-    fmt::Debug,
-    io::ErrorKind,
-    os::unix::io::{AsFd, OwnedFd},
-    str::FromStr,
-    sync::Arc,
+    collections::HashMap, fmt::Debug, io::ErrorKind, marker::PhantomData, os::unix::io::{AsFd, OwnedFd}, str::FromStr, sync::Arc
 };
 
 use drm::{
@@ -476,7 +471,8 @@ struct ElementPlaneConfig<'a, B: Buffer, F: Framebuffer> {
     z_index: usize,
     geometry: Rectangle<i32, Physical>,
     properties: PlaneProperties,
-    buffer: DrmScanoutBuffer<B, F>,
+    //buffer: DrmScanoutBuffer<B, F>,
+    buffer: PhantomData<DrmScanoutBuffer<B, F>>,
     failed_planes: &'a mut PlanesSnapshot,
 }
 
@@ -2845,6 +2841,7 @@ where
 
         let mut rendering_reason: Option<RenderingReason> = None;
 
+        let try_assign_primary_plane = true;
         if try_assign_primary_plane {
             match self.try_assign_primary_plane(
                 renderer,
@@ -2870,47 +2867,49 @@ where
             };
         }
 
-        if let Some(plane) = self.try_assign_cursor_plane(
-            renderer,
-            element,
-            element_zindex,
-            element_geometry,
-            scale,
-            frame_state,
-            output_transform,
-            output_geometry,
-            frame_flags,
-        ) {
-            trace!("assigned element {:?} to cursor {:?}", element.id(), plane.handle);
-            return Ok(plane);
-        }
+        return Err(None);
 
-        match self.try_assign_overlay_plane(
-            renderer,
-            element,
-            element_zindex,
-            element_geometry,
-            element_is_opaque,
-            element_states,
-            primary_plane_elements,
-            scale,
-            frame_state,
-            output_transform,
-            output_geometry,
-            frame_flags,
-        ) {
-            Ok(plane) => {
-                trace!(
-                    "assigned element {:?} to overlay plane {:?}",
-                    element.id(),
-                    plane.handle
-                );
-                return Ok(plane);
-            }
-            Err(err) => rendering_reason = rendering_reason.or(err),
-        }
+        //if let Some(plane) = self.try_assign_cursor_plane(
+            //renderer,
+            //element,
+            //element_zindex,
+            //element_geometry,
+            //scale,
+            //frame_state,
+            //output_transform,
+            //output_geometry,
+            //frame_flags,
+        //) {
+            //trace!("assigned element {:?} to cursor {:?}", element.id(), plane.handle);
+            //return Ok(plane);
+        //}
 
-        Err(rendering_reason)
+        //match self.try_assign_overlay_plane(
+            //renderer,
+            //element,
+            //element_zindex,
+            //element_geometry,
+            //element_is_opaque,
+            //element_states,
+            //primary_plane_elements,
+            //scale,
+            //frame_state,
+            //output_transform,
+            //output_geometry,
+            //frame_flags,
+        //) {
+            //Ok(plane) => {
+                //trace!(
+                    //"assigned element {:?} to overlay plane {:?}",
+                    //element.id(),
+                    //plane.handle
+                //);
+                //return Ok(plane);
+            //}
+            //Err(err) => rendering_reason = rendering_reason.or(err),
+        //}
+
+        //Err(rendering_reason)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2933,19 +2932,19 @@ where
         R: Renderer,
         E: RenderElement<R>,
     {
-        if !frame_flags
-            .intersects(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY)
-        {
-            return Err(None);
-        }
+        //if !frame_flags
+            //.intersects(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY)
+        //{
+            //return Err(None);
+        //}
 
-        if frame_state
-            .plane_state(self.surface.plane())
-            .map(|state| state.element_state.is_some())
-            .unwrap_or(true)
-        {
-            return Err(None);
-        }
+        //if frame_state
+            //.plane_state(self.surface.plane())
+            //.map(|state| state.element_state.is_some())
+            //.unwrap_or(true)
+        //{
+            //return Err(None);
+        //}
 
         let element_config = self.element_config(
             renderer,
@@ -2959,44 +2958,44 @@ where
             true,
         )?;
 
-        if let ScanoutBuffer::Swapchain(slot) = &frame_state
-            .plane_buffer(self.surface.plane())
-            .expect("We have a buffer for the primary plane")
-            .buffer
-        {
-            if !frame_flags.contains(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY)
-                && slot.format() != element_config.properties.format
-            {
-                trace!(
-                    "failed to assign element {:?} to primary {:?}, format doesn't match",
-                    element.id(),
-                    self.surface.plane()
-                );
-                return Err(None);
-            }
-        }
+        //if let ScanoutBuffer::Swapchain(slot) = &frame_state
+            //.plane_buffer(self.surface.plane())
+            //.expect("We have a buffer for the primary plane")
+            //.buffer
+        //{
+            //if !frame_flags.contains(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY)
+                //&& slot.format() != element_config.properties.format
+            //{
+                //trace!(
+                    //"failed to assign element {:?} to primary {:?}, format doesn't match",
+                    //element.id(),
+                    //self.surface.plane()
+                //);
+                //return Err(None);
+            //}
+        //}
 
-        let has_underlay = self
-            .planes
-            .overlay
-            .iter()
-            .filter(|plane| {
-                self.surface.plane_info().zpos.unwrap_or_default() > plane.zpos.unwrap_or_default()
-            })
-            .any(|plane| frame_state.is_assigned(plane.handle));
+        //let has_underlay = self
+            //.planes
+            //.overlay
+            //.iter()
+            //.filter(|plane| {
+                //self.surface.plane_info().zpos.unwrap_or_default() > plane.zpos.unwrap_or_default()
+            //})
+            //.any(|plane| frame_state.is_assigned(plane.handle));
 
-        if has_underlay {
-            trace!(
-                "failed to assign element {:?} to primary {:?}, already has underlay",
-                element.id(),
-                self.surface.plane()
-            );
-            return Err(None);
-        }
+        //if has_underlay {
+            //trace!(
+                //"failed to assign element {:?} to primary {:?}, already has underlay",
+                //element.id(),
+                //self.surface.plane()
+            //);
+            //return Err(None);
+        //}
 
-        if element_config.failed_planes.primary {
-            return Err(Some(RenderingReason::ScanoutFailed));
-        }
+        //if element_config.failed_planes.primary {
+            //return Err(Some(RenderingReason::ScanoutFailed));
+        //}
 
         let res = self.try_assign_plane(
             element,
@@ -3480,79 +3479,79 @@ where
             .underlying_storage(renderer)
             .ok_or(ExportBufferError::NoUnderlyingStorage)?;
 
-        let export_buffer = ExportBuffer::from_underlying_storage(&underlying_storage)
-            .ok_or(ExportBufferError::Unsupported)?;
+        //let export_buffer = ExportBuffer::from_underlying_storage(&underlying_storage)
+            //.ok_or(ExportBufferError::Unsupported)?;
 
-        if !self.framebuffer_exporter.can_add_framebuffer(&export_buffer) {
-            return Err(ExportBufferError::Unsupported);
-        }
+        //if !self.framebuffer_exporter.can_add_framebuffer(&export_buffer) {
+            //return Err(ExportBufferError::Unsupported);
+        //}
 
         // First we try to find a state in our new states, this is important if
         // we got the same id multiple times. If we can't find it we use the previous
         // state if available
-        if !element_states.contains_key(element_id) {
-            let previous_fb_cache = self
-                .previous_element_states
-                .get_mut(element_id)
-                // Note: We can mem::take the old fb_cache here here as we guarantee that
-                // the element state will always overwrite the current state at the end of render_frame
-                .map(|state| std::mem::take(&mut state.fb_cache))
-                .unwrap_or_default();
-            element_states.insert(
-                element_id.clone(),
-                ElementState {
-                    instances: SmallVec::new(),
-                    fb_cache: previous_fb_cache,
-                },
-            );
-        }
-        let element_fb_cache: &mut ElementFramebufferCache<
-            <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer,
-        > = element_states
-            .get_mut(element_id)
-            .map(|state| &mut state.fb_cache)
-            .unwrap();
+        //if !element_states.contains_key(element_id) {
+            //let previous_fb_cache = self
+                //.previous_element_states
+                //.get_mut(element_id)
+                //// Note: We can mem::take the old fb_cache here here as we guarantee that
+                //// the element state will always overwrite the current state at the end of render_frame
+                //.map(|state| std::mem::take(&mut state.fb_cache))
+                //.unwrap_or_default();
+            //element_states.insert(
+                //element_id.clone(),
+                //ElementState {
+                    //instances: SmallVec::new(),
+                    //fb_cache: previous_fb_cache,
+                //},
+            //);
+        //}
+        //let element_fb_cache: &mut ElementFramebufferCache<
+            //<F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer,
+        //> = element_states
+            //.get_mut(element_id)
+            //.map(|state| &mut state.fb_cache)
+            //.unwrap();
 
-        let element_cache_key =
-            ElementFramebufferCacheKey::from_underlying_storage(&underlying_storage, allow_opaque_fallback)
-                .ok_or(ExportBufferError::Unsupported)?;
-        let cached_fb = element_fb_cache.get(&element_cache_key);
+        //let element_cache_key =
+            //ElementFramebufferCacheKey::from_underlying_storage(&underlying_storage, allow_opaque_fallback)
+                //.ok_or(ExportBufferError::Unsupported)?;
+        //let cached_fb = element_fb_cache.get(&element_cache_key);
 
-        if cached_fb.is_none() {
-            trace!(
-                "no cached fb, exporting new fb for element {:?} underlying storage {:?}",
-                element_id, &underlying_storage
-            );
+        //if cached_fb.is_none() {
+            //trace!(
+                //"no cached fb, exporting new fb for element {:?} underlying storage {:?}",
+                //element_id, &underlying_storage
+            //);
 
-            let fb = self
-                .framebuffer_exporter
-                .add_framebuffer(self.surface.device_fd(), export_buffer, allow_opaque_fallback)
-                .map_err(|err| {
-                    trace!("failed to add framebuffer: {:?}", err);
-                    ExportBufferError::ExportFailed
-                })
-                .and_then(|fb| {
-                    fb.map(|fb| CachedDrmFramebuffer::new(DrmFramebuffer::Exporter(fb)))
-                        .ok_or(ExportBufferError::Unsupported)
-                });
+            //let fb = self
+                //.framebuffer_exporter
+                //.add_framebuffer(self.surface.device_fd(), export_buffer, allow_opaque_fallback)
+                //.map_err(|err| {
+                    //trace!("failed to add framebuffer: {:?}", err);
+                    //ExportBufferError::ExportFailed
+                //})
+                //.and_then(|fb| {
+                    //fb.map(|fb| CachedDrmFramebuffer::new(DrmFramebuffer::Exporter(fb)))
+                        //.ok_or(ExportBufferError::Unsupported)
+                //});
 
-            if fb.is_err() {
-                trace!(
-                    "could not import framebuffer for element {:?} underlying storage {:?}",
-                    element_id, &underlying_storage
-                );
-            }
+            //if fb.is_err() {
+                //trace!(
+                    //"could not import framebuffer for element {:?} underlying storage {:?}",
+                    //element_id, &underlying_storage
+                //);
+            //}
 
-            element_fb_cache.insert(element_cache_key.clone(), fb);
-        } else {
-            trace!(
-                "using cached fb for element {:?} underlying storage {:?}",
-                element_id, &underlying_storage
-            );
-        }
+            //element_fb_cache.insert(element_cache_key.clone(), fb);
+        //} else {
+            //trace!(
+                //"using cached fb for element {:?} underlying storage {:?}",
+                //element_id, &underlying_storage
+            //);
+        //}
 
-        let fb: &CachedDrmFramebuffer<<F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer> =
-            element_fb_cache.get(&element_cache_key).unwrap()?;
+        //let fb: &CachedDrmFramebuffer<<F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer> =
+            //element_fb_cache.get(&element_cache_key).unwrap()?;
 
         let src = element.src();
         let dst = output_transform.transform_rect_in(element_geometry, &output_geometry.size);
@@ -3564,22 +3563,27 @@ where
             output_transform.invert(),
         );
         let alpha = element.alpha();
+        let format = drm_fourcc::DrmFormat {
+            code: drm_fourcc::DrmFourcc::Abgr8888,
+            modifier: drm_fourcc::DrmModifier::Linear,
+        };
         let properties = PlaneProperties {
             src,
             dst,
             alpha,
             transform,
-            format: fb.format(),
+            format//: fb.format(),
         };
-        let buffer: DrmScanoutBuffer<
-            <A as Allocator>::Buffer,
-            <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer,
-        > = ScanoutBuffer::from_underlying_storage(underlying_storage)
-            .map(|buffer| DrmScanoutBuffer {
-                fb: fb.clone(),
-                buffer,
-            })
-            .ok_or(ExportBufferError::Unsupported)?;
+
+        //let buffer: DrmScanoutBuffer<
+            //<A as Allocator>::Buffer,
+            //<F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer,
+        //> = ScanoutBuffer::from_underlying_storage(underlying_storage)
+            //.map(|buffer| DrmScanoutBuffer {
+                //fb: fb.clone(),
+                //buffer,
+            //})
+            //.ok_or(ExportBufferError::Unsupported)?;
 
         if !element_states
             .get(element_id)
@@ -3691,6 +3695,7 @@ where
             })
             .unwrap();
 
+        let buffer = PhantomData;
         Ok(ElementPlaneConfig {
             properties,
             z_index: element_zindex,
@@ -3929,27 +3934,32 @@ where
     {
         let element_id = element.id();
 
-        let plane_claim = match self.surface.claim_plane(plane.handle) {
-            Some(claim) => claim,
-            None => {
-                trace!("failed to claim {:?} for element {:?}", plane.handle, element_id);
-                return Err(None);
-            }
-        };
+        //let plane_claim = match self.surface.claim_plane(plane.handle) {
+            //Some(claim) => claim,
+            //None => {
+                //trace!("failed to claim {:?} for element {:?}", plane.handle, element_id);
+                //return Err(None);
+            //}
+        //};
 
         // Try to assign the element to a plane
+        //trace!(
+            //"testing direct scan-out for element {:?} on {:?} with zpos {:?}: fb: {:?}, element_geometry: {:?}",
+            //element_id, plane.handle, plane.zpos, &element_config.buffer.fb, element_config.geometry
+        //);
+
         trace!(
-            "testing direct scan-out for element {:?} on {:?} with zpos {:?}: fb: {:?}, element_geometry: {:?}",
-            element_id, plane.handle, plane.zpos, &element_config.buffer.fb, element_config.geometry
+            "testing direct scan-out for element {:?} on {:?} with zpos: {:?}, element_geometry: {:?}",
+            element_id, plane.handle, plane.zpos, element_config.geometry
         );
 
-        if !plane.formats.contains(&element_config.properties.format) {
-            trace!(
-                "skipping direct scan-out on {:?} with zpos {:?} for element {:?}, format {:?} not supported",
-                plane.handle, plane.zpos, element_id, element_config.properties.format,
-            );
-            return Err(Some(RenderingReason::FormatUnsupported));
-        }
+        //if !plane.formats.contains(&element_config.properties.format) {
+            //trace!(
+                //"skipping direct scan-out on {:?} with zpos {:?} for element {:?}, format {:?} not supported",
+                //plane.handle, plane.zpos, element_id, element_config.properties.format,
+            //);
+            //return Err(Some(RenderingReason::FormatUnsupported));
+        //}
 
         let previous_state = self
             .pending_frame
@@ -3968,105 +3978,111 @@ where
         });
 
         let element_damage = element.damage_since(scale, previous_commit);
-        let has_element_damage = !element_damage.is_empty();
+        //let has_element_damage = !element_damage.is_empty();
 
-        let damage_clips = if has_element_damage {
-            PlaneDamageClips::from_damage(
-                self.surface.device_fd(),
-                element_config.properties.src,
-                element_config.geometry,
-                element_damage,
-            )
-            .ok()
-            .flatten()
-        } else {
-            None
-        };
+        tracing::warn!("Would have computed FB_DAMAGE_CLIP:");
+        tracing::warn!("src: {:?}, dst: {:?}, damage: {:#?}",
+            element_config.properties, element_config.geometry, element_damage);
 
-        let config = PlaneConfig {
-            properties: element_config.properties,
-            buffer: element_config.buffer.clone(),
-            damage_clips,
-            plane_claim,
-            sync: element_config
-                .buffer
-                .buffer
-                .acquire_point(self.signaled_fence.as_ref()),
-        };
+        return Err(None);
 
-        let is_compatible = previous_state
-            .plane_state(plane.handle)
-            .map(|state| {
-                state
-                    .config
-                    .as_ref()
-                    .map(|c| c.is_compatible(&config))
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
+        //let damage_clips = if has_element_damage {
+            //PlaneDamageClips::from_damage(
+                //self.surface.device_fd(),
+                //element_config.properties.src,
+                //element_config.geometry,
+                //element_damage,
+            //)
+            //.ok()
+            //.flatten()
+        //} else {
+            //None
+        //};
 
-        // We can only skip the plane update if we have no damage and if
-        // the src/dst/alpha properties are unchanged. Also we can not skip if
-        // the fb did change (this includes the case where we previously
-        // had not assigned anything to the plane)
-        let skip = !has_element_damage
-            && previous_state
-                .plane_state(plane.handle)
-                .map(|state| {
-                    state
-                        .config
-                        .as_ref()
-                        .map(|c| is_compatible && c.buffer.fb == config.buffer.fb)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+        //let config = PlaneConfig {
+            //properties: element_config.properties,
+            //buffer: element_config.buffer.clone(),
+            //damage_clips,
+            //plane_claim,
+            //sync: element_config
+                //.buffer
+                //.buffer
+                //.acquire_point(self.signaled_fence.as_ref()),
+        //};
 
-        let plane_state = PlaneState {
-            skip,
-            needs_test: true,
-            element_state: Some(PlaneElementState {
-                id: element_id.clone(),
-                commit: element.current_commit(),
-                z_index: element_config.z_index,
-                cursor_size: None,
-            }),
-            config: Some(config),
-        };
+        //let is_compatible = previous_state
+            //.plane_state(plane.handle)
+            //.map(|state| {
+                //state
+                    //.config
+                    //.as_ref()
+                    //.map(|c| c.is_compatible(&config))
+                    //.unwrap_or(false)
+            //})
+            //.unwrap_or(false);
 
-        let res = if is_compatible {
-            trace!(
-                "skipping atomic test for compatible element {:?} on {:?} with zpos {:?}",
-                element_id, plane.handle, plane.zpos,
-            );
-            frame_state.set_state(plane.handle, plane_state);
-            true
-        } else {
-            frame_state
-                .test_state(
-                    &self.surface,
-                    self.supports_fencing,
-                    plane.handle,
-                    plane_state,
-                    false,
-                )
-                .is_ok()
-        };
+        //// We can only skip the plane update if we have no damage and if
+        //// the src/dst/alpha properties are unchanged. Also we can not skip if
+        //// the fb did change (this includes the case where we previously
+        //// had not assigned anything to the plane)
+        //let skip = !has_element_damage
+            //&& previous_state
+                //.plane_state(plane.handle)
+                //.map(|state| {
+                    //state
+                        //.config
+                        //.as_ref()
+                        //.map(|c| is_compatible && c.buffer.fb == config.buffer.fb)
+                        //.unwrap_or(false)
+                //})
+                //.unwrap_or(false);
 
-        if res {
-            trace!(
-                "successfully assigned element {:?} to {:?} with zpos {:?} for direct scan-out",
-                element_id, plane.handle, plane.zpos,
-            );
+        //let plane_state = PlaneState {
+            //skip,
+            //needs_test: true,
+            //element_state: Some(PlaneElementState {
+                //id: element_id.clone(),
+                //commit: element.current_commit(),
+                //z_index: element_config.z_index,
+                //cursor_size: None,
+            //}),
+            //config: Some(config),
+        //};
 
-            Ok(plane.into())
-        } else {
-            trace!(
-                "skipping direct scan-out on {:?} with zpos {:?} for element {:?}, test failed",
-                plane.handle, plane.zpos, element_id
-            );
+        //let res = if is_compatible {
+            //trace!(
+                //"skipping atomic test for compatible element {:?} on {:?} with zpos {:?}",
+                //element_id, plane.handle, plane.zpos,
+            //);
+            //frame_state.set_state(plane.handle, plane_state);
+            //true
+        //} else {
+            //frame_state
+                //.test_state(
+                    //&self.surface,
+                    //self.supports_fencing,
+                    //plane.handle,
+                    //plane_state,
+                    //false,
+                //)
+                //.is_ok()
+        //};
 
-            Err(Some(RenderingReason::ScanoutFailed))
-        }
+        //if res {
+            //trace!(
+                //"successfully assigned element {:?} to {:?} with zpos {:?} for direct scan-out",
+                //element_id, plane.handle, plane.zpos,
+            //);
+
+            //Ok(plane.into())
+        //} else {
+            //trace!(
+                //"skipping direct scan-out on {:?} with zpos {:?} for element {:?}, test failed",
+                //plane.handle, plane.zpos, element_id
+            //);
+
+            //Err(Some(RenderingReason::ScanoutFailed))
+        //}
     }
 
     /// Clear the surface, setting DPMS state to off, disabling all planes,
