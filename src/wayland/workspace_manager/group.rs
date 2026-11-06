@@ -1,28 +1,20 @@
 //! Workspace Group
 
 use std::{
-    hash::Hash,
-    ops::Deref,
-    sync::{Arc, Mutex, atomic::Ordering},
+    collections::HashSet, hash::Hash, ops::Deref, sync::{Arc, Mutex, atomic::Ordering},
 };
 
-use portable_atomic::AtomicBool;
 use wayland_protocols::ext::workspace::v1::server::{
-    ext_workspace_group_handle_v1::{self, ExtWorkspaceGroupHandleV1, GroupCapabilities},
-    ext_workspace_manager_v1::ExtWorkspaceManagerV1,
+    ext_workspace_group_handle_v1::{self, ExtWorkspaceGroupHandleV1, GroupCapabilities}, ext_workspace_handle_v1::ExtWorkspaceHandleV1, ext_workspace_manager_v1::ExtWorkspaceManagerV1,
 };
 use wayland_server::{
-    Client, Dispatch, DisplayHandle, Resource, Weak, backend::ClientId, protocol::wl_output::WlOutput,
+    Client, Dispatch, DisplayHandle, Resource, Weak, backend::{ClientId, ObjectId}, protocol::wl_output::WlOutput,
 };
 
 use crate::{
-    output::{Output, WeakOutput},
-    utils::user_data::UserDataMap,
-    wayland::{
-        Dispatch2,
-        workspace_manager::{
-            PendingRequest, WorkspaceHandler, WorkspaceManagerObjectData, WorkspaceManagerState,
-            workspace::{self, WeakWorkspace, Workspace},
+    output::{Output, WeakOutput}, utils::user_data::UserDataMap, wayland::{
+        Dispatch2, workspace_manager::{
+            PendingRequest, WorkspaceHandler, WorkspaceManagerObjectData, WorkspaceManagerState, workspace::{self, WeakWorkspace, Workspace, WorkspaceData},
         },
     },
 };
@@ -32,7 +24,7 @@ const GROUP_VERSION: u32 = 1;
 /// A handle to a workspace group.
 #[derive(Debug, Clone)]
 pub struct WorkspaceGroup {
-    inner: Arc<(Mutex<Inner>, UserDataMap)>,
+    pub(crate) inner: Arc<(Mutex<Inner>, UserDataMap)>,
 }
 
 /// Weak version of [`WorkspaceGroup`].
@@ -41,19 +33,28 @@ pub struct WeakWorkspaceGroup {
     inner: std::sync::Weak<(Mutex<Inner>, UserDataMap)>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct WorkspaceGroupState {
+    capabilities: GroupCapabilities,
+}
+
 /// Workspace internal data.
 #[derive(Debug)]
 pub(crate) struct Inner {
-    capabilities: GroupCapabilities,
+    pending_state: WorkspaceGroupState,
+    current_state: WorkspaceGroupState,
 
-    outputs: Vec<WeakOutput>,
+    pending_outputs: HashSet<WeakOutput>,
+    outputs: HashSet<WeakOutput>,
+
     workspaces: Vec<WeakWorkspace>,
 
+    newly_created: bool,
+    pending_removal: bool,
     instances: Vec<ExtWorkspaceGroupHandleV1>,
-    done_needed: Option<Arc<AtomicBool>>,
 }
 
-/// Data associated with workspace group handles.
+/// Data associated with workspace group handle.
 #[derive(Debug)]
 pub struct WorkspaceGroupData {
     handle: WeakWorkspaceGroup,
@@ -66,14 +67,20 @@ pub(crate) enum PendingGroupRequest {
 }
 
 impl WorkspaceGroup {
-    fn new(capabilities: GroupCapabilities, capacity: usize, done_needed: Arc<AtomicBool>) -> Self {
+    fn new(capabilities: GroupCapabilities, capacity: usize) -> Self {
         let inner = Arc::new((
             Mutex::new(Inner {
-                capabilities,
+                pending_state: WorkspaceGroupState { capabilities },
+                current_state: WorkspaceGroupState { capabilities: GroupCapabilities::empty() },
+
+                pending_outputs: Default::default(),
                 outputs: Default::default(),
+
                 workspaces: Default::default(),
+
+                newly_created: true,
+                pending_removal: false,
                 instances: Vec::with_capacity(capacity),
-                done_needed: Some(done_needed),
             }),
             UserDataMap::default(),
         ));
@@ -100,35 +107,41 @@ impl WorkspaceGroup {
         &self.inner.1
     }
 
-    /// Gets the workspace group's capabilities.
-    pub fn capabilities(&self) -> GroupCapabilities {
-        self.inner.0.lock().unwrap().capabilities
+    pub fn has_pending_changes(&self) -> bool {
+        let guard = self.inner.0.lock().unwrap();
+
+        guard.pending_state != guard.current_state || guard.newly_created || guard.pending_removal
     }
 
-    /// Sets the workspace group capabilities.
-    pub fn set_capabilities(&self, capabilities: GroupCapabilities) {
-        self.inner.0.lock().unwrap().set_capabilities(capabilities);
-    }
+    ///// Gets the workspace group's capabilities.
+    //pub fn capabilities(&self) -> GroupCapabilities {
+        //self.inner.0.lock().unwrap().capabilities
+    //}
 
-    /// Gets the list of [`Output`] in this group.
-    pub fn outputs(&self) -> Vec<Output> {
-        let inner = self.inner.0.lock().unwrap();
-        inner.outputs.iter().filter_map(|o| o.upgrade()).collect()
-    }
+    ///// Sets the workspace group capabilities.
+    //pub fn set_capabilities(&self, capabilities: GroupCapabilities) {
+        //self.inner.0.lock().unwrap().set_capabilities(capabilities);
+    //}
 
-    /// Check whether an [`Output`] is in this group.
-    pub fn has_output(&self, output: &Output) -> bool {
-        let inner = self.inner.0.lock().unwrap();
+    ///// Gets the list of [`Output`] in this group.
+    //pub fn outputs(&self) -> Vec<Output> {
+    //    let inner = self.inner.0.lock().unwrap();
+    //    inner.outputs.iter().filter_map(|o| o.upgrade()).collect()
+    //}
 
-        inner.outputs.iter().find(|o| o == &output).is_some()
-    }
+    ///// Check whether an [`Output`] is in this group.
+    //pub fn has_output(&self, output: &Output) -> bool {
+        //let inner = self.inner.0.lock().unwrap();
+
+        //inner.outputs.iter().find(|o| o == &output).is_some()
+    //}
 
     /// Adds an [`Output`] to this `WorkspaceGroup`.
     ///
     /// If the output is already in the workspace group, this function does nothing.
     /// Otherwise, the output is added and the `output_enter` signal is sent to all instances.
     pub fn output_enter(&self, output: &Output) {
-        self.inner.0.lock().unwrap().add_output(self, output);
+        self.inner.0.lock().unwrap().pending_outputs.insert(output.downgrade());//.add_output(self, output);
     }
 
     /// Removes an [`Output`] to this `WorkspaceGroup`.
@@ -136,28 +149,42 @@ impl WorkspaceGroup {
     /// If the output isn't in the workspace group, this function does nothing.
     /// Otherwise, the output is removed and the `output_leave` signal is sent to all instances.
     pub fn output_leave(&self, output: &Output) {
-        self.inner.0.lock().unwrap().remove_output(self, output);
+        self.inner.0.lock().unwrap().pending_outputs.retain(|o| o != output);
     }
 
-    /// Gets the workspaces currently part of this `WorkspaceGroup`.
-    pub fn workspaces(&self) -> Vec<Workspace> {
-        let inner = self.inner.0.lock().unwrap();
-        inner.workspaces.iter().filter_map(|w| w.upgrade()).collect()
-    }
+    ///// Gets the workspaces currently part of this `WorkspaceGroup`.
+    //pub fn workspaces(&self) -> Vec<Workspace> {
+        //let inner = self.inner.0.lock().unwrap();
+        //inner.workspaces.iter().filter_map(|w| w.upgrade()).collect()
+    //}
 
-    /// Adds a [`Workspace`] to this `WorkspaceGroup`.
-    ///
-    /// If the `Workspace` is already in the group, this function does nothing.
-    /// Otherwise, if the `Workspace` is already in a group, the `workspace_leave` signal will be
-    /// sent to all instances, followed by the `workspace_enter` signal.
-    pub fn workspace_enter(&self, workspace: &Workspace) {
-        self.inner.0.lock().unwrap().add_workspace(self, workspace);
-    }
+    ///// Adds a [`Workspace`] to this `WorkspaceGroup`.
+    /////
+    ///// If the `Workspace` is already in the group, this function does nothing.
+    ///// Otherwise, if the `Workspace` is already in a group, the `workspace_leave` signal will be
+    ///// sent to all instances, followed by the `workspace_enter` signal.
+    //pub fn workspace_enter(&self, workspace: &Workspace) {
+        //let mut inner = self.inner.0.lock().unwrap();
 
-    /// Remove a [`Workspace`] from this `WorkspaceGroup`.
-    pub fn workspace_leave(&self, workspace: &Workspace) {
-        self.inner.0.lock().unwrap().remove_workspace(self, workspace);
-    }
+        //if inner.pending_workspaces.iter().any(|w| w == workspace) {
+            //return;
+        //}
+
+        //inner.pending_workspaces.push(workspace.downgrade());
+        //workspace.inner.0.lock().unwrap().pending_group = Some(self.downgrade());
+    //}
+
+    ///// Remove a [`Workspace`] from this `WorkspaceGroup`.
+    //pub fn workspace_leave(&self, workspace: &Workspace) {
+        //let mut inner = self.inner.0.lock().unwrap();
+
+        //if let Some(pos) = inner.pending_workspaces.iter().position(|w| w == workspace) {
+            //inner.pending_workspaces.remove(pos);
+        //}
+
+        //self.inner.0.lock().unwrap().remove_workspace(self, workspace);
+        //workspace.inner.0.lock().unwrap().pending_group = None;
+    //}
 
     pub(super) fn new_instance<D>(
         &self,
@@ -181,18 +208,18 @@ impl WorkspaceGroup {
 
         let mut inner = self.inner.0.lock().unwrap();
 
-        for workspace in &inner.workspaces {
-            let Some(workspace) = workspace.upgrade() else {
-                continue;
-            };
+        //for workspace in &inner.workspaces {
+            //let Some(workspace) = workspace.upgrade() else {
+                //continue;
+            //};
 
-            let w_inner = workspace.inner.0.lock().unwrap();
-            let Some(w_instance) = w_inner.instance_with_manager(&manager.id()) else {
-                continue;
-            };
+            //let w_inner = workspace.inner.0.lock().unwrap();
+            //let Some(w_instance) = w_inner.instance_with_manager(&manager.id()) else {
+                //continue;
+            //};
 
-            instance.workspace_enter(w_instance);
-        }
+            //instance.workspace_enter(w_instance);
+        //}
 
         for output in &inner.outputs {
             let Some(output) = output.upgrade() else {
@@ -248,75 +275,7 @@ impl WeakWorkspaceGroup {
 }
 
 impl Inner {
-    fn add_output(&mut self, handle: &WorkspaceGroup, output: &Output) {
-        if self.outputs.iter().any(|o| o == output) {
-            return;
-        }
-
-        let mut dirty = false;
-        for instance in &self.instances {
-            let Some(client) = instance.client() else {
-                continue;
-            };
-
-            for output in output.client_outputs(&client) {
-                instance.output_enter(&output);
-                dirty = true;
-            }
-        }
-
-        if dirty {
-            self.need_done();
-        }
-
-        output
-            .inner
-            .0
-            .lock()
-            .unwrap()
-            .workspace_groups
-            .insert(handle.downgrade());
-        self.outputs.push(output.downgrade());
-    }
-
-    fn remove_output(&mut self, handle: &WorkspaceGroup, output: &Output) {
-        let Some(pos) = self.outputs.iter().position(|o| o == output) else {
-            return;
-        };
-        self.outputs.remove(pos);
-
-        let mut dirty = false;
-        for instance in &self.instances {
-            let Some(client) = instance.client() else {
-                continue;
-            };
-
-            for output in output.client_outputs(&client) {
-                instance.output_leave(&output);
-                dirty = true;
-            }
-        }
-
-        if dirty {
-            self.need_done();
-        }
-
-        output
-            .inner
-            .0
-            .lock()
-            .unwrap()
-            .workspace_groups
-            .remove(&handle.downgrade());
-        self.outputs.retain(|o| o != output);
-    }
-
     fn on_output_bind(&mut self, client: ClientId, output: &WlOutput) {
-        // This is safe as done_needed is only ever removed after all output_leave in remove_group.
-        // We want this to know whether to send done now, or let the user trigger it as part of
-        // whatever action they were doing.
-        let send_done = !self.done_needed.as_ref().unwrap().load(Ordering::Acquire);
-
         for instance in self
             .instances
             .iter()
@@ -324,104 +283,82 @@ impl Inner {
         {
             instance.output_enter(output);
 
-            if send_done {
-                let Ok(manager) = instance.data::<WorkspaceGroupData>().unwrap().manager.upgrade() else {
-                    continue;
-                };
-
-                manager.done();
-            }
-        }
-    }
-
-    fn add_workspace(&mut self, handle: &WorkspaceGroup, workspace: &Workspace) {
-        let mut w_inner = workspace.inner.0.lock().unwrap();
-
-        if let Some(group) = w_inner.group.as_ref().and_then(WeakWorkspaceGroup::upgrade) {
-            if &group != handle {
-                group
-                    .inner
-                    .0
-                    .lock()
-                    .unwrap()
-                    .remove_workspace_inner(w_inner.deref());
-            } else {
-                return;
-            }
-        };
-
-        let mut dirty = false;
-        for instance in &self.instances {
-            let data = instance.data::<WorkspaceGroupData>().unwrap();
-
-            let manager_id = data.manager.id();
-
-            let Some(w_instance) = w_inner.instance_with_manager(&manager_id) else {
+            let Ok(manager) = instance.data::<WorkspaceGroupData>().unwrap().manager.upgrade() else {
                 continue;
             };
 
-            instance.workspace_enter(w_instance);
-            dirty = true;
-        }
-
-        if dirty {
-            self.need_done();
-        }
-
-        w_inner.group = Some(handle.downgrade());
-        self.workspaces.push(workspace.downgrade());
-    }
-
-    fn remove_workspace(&mut self, handle: &WorkspaceGroup, workspace: &Workspace) {
-        let mut w_inner = workspace.inner.0.lock().unwrap();
-
-        if w_inner.group.take_if(|g| g == handle).is_none() {
-            return;
-        }
-
-        self.remove_workspace_inner(w_inner.deref());
-
-        self.workspaces.retain(|w| w != workspace);
-    }
-
-    fn remove_workspace_inner(&mut self, w_inner: &workspace::Inner) {
-        let mut dirty = false;
-
-        for instance in &self.instances {
-            let data = instance.data::<WorkspaceGroupData>().unwrap();
-
-            let manager_id = data.manager.id();
-
-            let Some(w_instance) = w_inner.instance_with_manager(&manager_id) else {
-                continue;
-            };
-
-            instance.workspace_leave(w_instance);
-            dirty = true;
-        }
-
-        if dirty {
-            self.need_done();
+            manager.done();
         }
     }
 
-    fn set_capabilities(&mut self, capabilities: GroupCapabilities) {
-        if self.capabilities != capabilities {
-            self.capabilities = capabilities;
+    pub(crate) fn instances_with_manager(&self, manager: ObjectId) -> impl Iterator<Item = ExtWorkspaceGroupHandleV1> {
+        self.instances.iter().cloned().filter(|i| {
+            Resource::id(i).same_client_as(&manager)
+                && &i.data::<WorkspaceData>().unwrap().manager.id() == manager
+        })
+    }
+
+    pub(crate) fn workspace_enter(&mut self, workspace: &ExtWorkspaceHandleV1) {
+        let data = workspace.data::<WorkspaceData>().unwrap();
+        let manager_id = data.manager.id();
+
+        for instance in self.instances_with_manager(manager_id) {
+            instance.workspace_enter(workspace);
+        }
+    }
+
+    pub(crate) fn workspace_leave(&mut self, workspace: &ExtWorkspaceHandleV1) {
+        let data = workspace.data::<WorkspaceData>().unwrap();
+
+        let manager_id = data.manager.id();
+
+        for instance in self.instances_with_manager(manager_id) {
+            instance.workspace_leave(workspace);
+        }
+    }
+
+    fn apply_changes(&mut self) -> bool {
+        let caps_changed = self.pending_state.capabilities != self.current_state.capabilities;
+
+        if caps_changed {
+            self.current_state.capabilities = self.pending_state.capabilities;
+        }
+
+        let changed = caps_changed;
+
+        let new_outputs: Vec<_> = self.pending_outputs
+            .difference(&self.outputs)
+            .filter_map(WeakOutput::upgrade)
+            .collect();
+        let old_outputs: Vec<_> = self.outputs
+            .difference(&self.pending_outputs)
+            .filter_map(WeakOutput::upgrade)
+            .collect();
+
+        self.outputs = self.pending_outputs.clone();
+
+        let changed = changed | !new_outputs.is_empty() | !new_outputs.is_empty();
+
+        if changed {
+            let state = &self.current_state;
 
             for instance in &self.instances {
-                instance.capabilities(capabilities);
+                if caps_changed { instance.capabilities(state.capabilities); };
+
+                if let Some(client) = instance.client() {
+                    old_outputs
+                        .iter()
+                        .flat_map(|o| o.client_outputs(&client))
+                        .for_each(|wl| instance.output_leave(&wl));
+                    new_outputs
+                        .iter()
+                        .flat_map(|o| o.client_outputs(&client))
+                        .for_each(|wl| instance.output_enter(&wl));
+                }
             }
-
-            self.need_done();
         }
-    }
 
-    #[inline]
-    fn need_done(&mut self) {
-        if let Some(done_needed) = self.done_needed.as_mut() {
-            done_needed.store(true, Ordering::Release);
-        }
+        changed
     }
 }
 
@@ -441,7 +378,7 @@ impl WorkspaceManagerState {
         D: Dispatch<ExtWorkspaceGroupHandleV1, WorkspaceGroupData>,
         D: 'static,
     {
-        let group = WorkspaceGroup::new(capabilities, self.instances.len(), self.done_needed.clone());
+        let group = WorkspaceGroup::new(capabilities, self.instances.len());
 
         for instance in &self.instances {
             let Ok(client) = self.display.get_client(instance.id()) else {
@@ -452,7 +389,6 @@ impl WorkspaceManagerState {
         }
 
         self.groups.push(group.clone());
-        self.done_needed.store(true, Ordering::Release);
         group
     }
 
@@ -468,31 +404,43 @@ impl WorkspaceManagerState {
     /// after calling this function the [`WorkspaceGroup`] will be functionally inert (it contains
     /// no client instances, and none can be added back).
     pub fn remove_group(&mut self, group: WorkspaceGroup) {
-        self.groups.retain(|g| g != &group);
+        //self.groups.retain(|g| g != &group);
 
-        let workspaces = group.workspaces();
-        for workspace in workspaces {
-            group.workspace_leave(&workspace);
-        }
+        //let workspaces = group.workspaces();
+        //for workspace in workspaces {
+            //group.workspace_leave(&workspace);
+        //}
 
-        let outputs = group.outputs();
-        for output in outputs {
-            group.output_leave(&output);
-        }
+        //let outputs = group.outputs();
+        //for output in outputs {
+            //group.output_leave(&output);
+        //}
 
-        let mut inner = group.inner.0.lock().unwrap();
+        //let mut inner = group.inner.0.lock().unwrap();
 
-        for instance in inner.instances.drain(..) {
-            instance.removed();
-        }
-        inner.done_needed.take();
+        //for instance in inner.instances.drain(..) {
+            //instance.removed();
+        //}
+        //inner.done_needed.take();
 
-        self.done_needed.store(true, Ordering::Release);
+        //self.done_needed.store(true, Ordering::Release);
     }
 
     /// Gets an iterator over managed [`WorkspaceGroup`].
     pub fn groups(&self) -> std::slice::Iter<'_, WorkspaceGroup> {
         self.groups.iter()
+    }
+
+    /// Send groups changes.
+    ///
+    /// This function will send groups capabilities as well as outpus enter/leave events for all
+    /// groups. If called explicitely, it should be called before
+    /// [`WorkspaceManagerState::send_workspaces_changes`] so groups are properly created by the
+    /// time workspace_enter/leave events are sent.
+    pub fn send_groups_changes(&mut self) -> bool {
+        let mut changed = false;
+
+        changed
     }
 }
 

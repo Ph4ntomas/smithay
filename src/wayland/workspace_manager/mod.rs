@@ -4,9 +4,8 @@
 //! with a list of workspaces and their properties, and allowing them to activate and deactivate
 //! workspaces.
 
-use std::sync::{Arc, Mutex, MutexGuard, atomic::Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use portable_atomic::AtomicBool;
 use wayland_protocols::ext::workspace::v1::server::{
     ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1,
     ext_workspace_handle_v1::ExtWorkspaceHandleV1,
@@ -71,7 +70,6 @@ pub struct WorkspaceManagerState {
     pub(crate) groups: Vec<WorkspaceGroup>,
 
     pub(crate) instances: Vec<ExtWorkspaceManagerV1>,
-    pub(crate) done_needed: Arc<AtomicBool>,
 }
 
 /// Data associated with manager handle.
@@ -173,7 +171,6 @@ impl WorkspaceManagerState {
             groups: Default::default(),
 
             instances: Default::default(),
-            done_needed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -188,14 +185,23 @@ impl WorkspaceManagerState {
     /// been sent.
     ///
     /// This allows changes to one or more group or workspace properties to be seen as atomic.
-    pub fn done(&mut self) {
-        let need_done = self.done_needed.swap(false, Ordering::Acquire);
+    pub fn done(&mut self, force: bool) {
+        let mut changed = force;
+        // Send group done.
+        changed |= self.send_groups_changes();
 
-        if need_done {
+        // Send workspaces done.
+        changed |= self.send_workspaces_changes();
+
+        if changed {
             for instance in &self.instances {
                 instance.done();
             }
         }
+    }
+
+    pub fn refresh(&mut self) {
+        self.done(false);
     }
 
     fn remove_instance(&mut self, manager: &ExtWorkspaceManagerV1, with_events: bool) {

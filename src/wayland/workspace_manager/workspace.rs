@@ -2,10 +2,9 @@
 
 use std::{
     hash::Hash,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex},
 };
 
-use portable_atomic::AtomicBool;
 use wayland_protocols::ext::workspace::v1::server::{
     ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1,
     ext_workspace_handle_v1::{self, ExtWorkspaceHandleV1, State, WorkspaceCapabilities},
@@ -41,36 +40,43 @@ pub struct WeakWorkspace {
     inner: std::sync::Weak<(Mutex<Inner>, UserDataMap)>,
 }
 
+/// Workspace state
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceState {
+    pub name: String,
+    pub coordinates: Vec<u32>,
+    pub state: State,
+    pub capabilities: WorkspaceCapabilities,
+}
+
 /// Workspace internal data.
 #[derive(Debug)]
 pub(crate) struct Inner {
-    id: Option<String>,
-    name: String,
-    coordinates: Vec<u32>,
-    state: State,
-    capabilities: WorkspaceCapabilities,
+    pending_state: WorkspaceState,
+    current_state: WorkspaceState,
 
+    pending_id: Option<String>,
+    current_id: Option<String>,
+
+    pub(crate) pending_group: Option<WeakWorkspaceGroup>,
     pub(crate) group: Option<WeakWorkspaceGroup>,
 
+    pending_removal: bool,
     pub(crate) instances: Vec<ExtWorkspaceHandleV1>,
-    done_needed: Option<Arc<AtomicBool>>,
 }
 
 /// Data associated with workspace handles.
 #[derive(Debug)]
 pub struct WorkspaceData {
-    handle: WeakWorkspace,
-    manager: Weak<ExtWorkspaceManagerV1>,
+    pub(crate) handle: WeakWorkspace,
+    pub(crate) manager: Weak<ExtWorkspaceManagerV1>,
 }
 
 /// Workspace Builder
 #[derive(Debug)]
 pub struct Builder {
+    state: WorkspaceState,
     id: Option<String>,
-    name: String,
-    coordinates: Vec<u32>,
-    state: State,
-    capabilities: WorkspaceCapabilities,
 }
 
 #[derive(Debug)]
@@ -85,11 +91,11 @@ impl Workspace {
     /// Gets a builder object for [`Workspace`].
     pub fn builder(name: String) -> Builder {
         Builder {
+            state: WorkspaceState {
+                name,
+                ..Default::default()
+            },
             id: None,
-            name,
-            coordinates: Default::default(),
-            state: State::empty(),
-            capabilities: WorkspaceCapabilities::all(),
         }
     }
 
@@ -110,72 +116,44 @@ impl Workspace {
         &self.inner.1
     }
 
-    /// Gets the current [`State`] of the `Workspace`.
-    pub fn state(&self) -> State {
-        self.inner.0.lock().unwrap().state
+    /// Allow the pending state of this Workspace to be manipulated.
+    pub fn with_pending_state<F, T>(&self, with_state: F) -> T
+    where
+        F: FnOnce(&mut WorkspaceState) -> T,
+    {
+        let mut guard = self.inner.0.lock().unwrap();
+        with_state(&mut guard.pending_state)
     }
 
-    /// Sets the current [`State`] of the `Workspace`.
-    pub fn set_state(&self, new_state: State) {
-        self.inner.0.lock().unwrap().set_state(new_state);
+    /// Allow access to the current state, as seen by a client.
+    pub fn with_current_state<F, T>(&self, with_state: F) -> T
+    where
+        F: FnOnce(&WorkspaceState) -> T,
+    {
+        let guard = self.inner.0.lock().unwrap();
+        with_state(&guard.pending_state)
     }
 
-    /// Checks whether the `Workspace` is active.
-    pub fn active(&self) -> bool {
-        self.state().contains(State::Active)
+    /// Check if the workspace has pending changes that have not yet been sent to clients.
+    pub fn has_pending_changes(&self) -> bool {
+        let guard = self.inner.0.lock().unwrap();
+
+        guard.pending_state != guard.current_state
+            || guard.pending_id.is_some()
+            || guard.pending_group != guard.group
+            || guard.pending_removal
     }
 
-    /// Activate the workspace.
-    ///
-    /// This function is a shorthand to calling [`Workspace::set_state`] when only the active flag
-    /// has to be set.
-    pub fn activate(&mut self) {
-        self.inner.0.lock().unwrap().set_state_flag(State::Active, true);
-    }
-
-    /// Activate the workspace.
-    ///
-    /// This function is a shorthand to calling [`Workspace::set_state`] when only the active flag
-    /// has to be unset.
-    pub fn deactivate(&mut self) {
-        self.inner.0.lock().unwrap().set_state_flag(State::Active, false);
-    }
-
-    /// Checks whether the `Workspace`'s urgent flag is set.
-    pub fn urgent(&self) -> bool {
-        self.state().contains(State::Urgent)
-    }
-
-    /// Sets the `Workspace`'s urgent flag.
-    ///
-    /// This function is a shorthand to calling [`Workspace::set_state`] when only the Urgent flag
-    /// need to be changed.
-    pub fn set_urgent(&mut self, urgent: bool) {
-        self.inner.0.lock().unwrap().set_state_flag(State::Urgent, urgent);
-    }
-
-    /// Checks whether the `Workspace`'s hidden flag is set.
-    pub fn hidden(&self) -> bool {
-        self.state().contains(State::Hidden)
-    }
-
-    /// Sets the `Workspace`'s hidden flag.
-    ///
-    /// This function is a shorthand to calling [`Workspace::set_state`] when only the hidden flag
-    /// need to be changed.
-    pub fn set_hidden(&mut self, hidden: bool) {
-        self.inner.0.lock().unwrap().set_state_flag(State::Hidden, hidden);
-    }
-
-    /// Gets the `Workspace`'s id.
-    pub fn id(&self) -> Option<String> {
-        self.inner.0.lock().unwrap().id.clone()
+    /// Check if the workspace was marked for removal.
+    pub fn is_pending_removal(&self) -> bool {
+        self.inner.0.lock().unwrap().pending_removal
     }
 
     /// Sets the `Workspace`'s id.
     ///
     /// `Workspace` can be assigned a unique, stable identifier. If the id was set, this function
-    /// returns true.
+    /// returns `true`. If the id was previously assigned and has already been sent to clients, this
+    /// function will return `false`.
     ///
     /// NOTE: It's up to the compositor to ensure the id are unique. Not doing that is a protocol
     /// violation.
@@ -183,34 +161,29 @@ impl Workspace {
         self.inner.0.lock().unwrap().set_id(id)
     }
 
-    /// Gets the `Workspace`'s name.
-    pub fn name(&self) -> String {
-        self.inner.0.lock().unwrap().name.clone()
+    /// Gets the `Workspace`'s id.
+    pub fn id(&mut self) -> Option<String> {
+        self.inner.0.lock().unwrap().current_id.clone()
     }
 
-    /// Sets the `Workspace`'s name.
-    pub fn set_name(&mut self, name: String) {
-        self.inner.0.lock().unwrap().set_name(name);
+    /// Assign the workspace to a group.
+    pub fn assign(&self, group: WorkspaceGroup) {
+        self.inner.0.lock().unwrap().pending_group = Some(group.downgrade());
     }
 
-    /// Gets the `Workspace`'s coordinates.
-    pub fn coordinates(&self) -> Vec<u32> {
-        self.inner.0.lock().unwrap().coordinates.clone()
+    /// Remove the workspace from its current group.
+    pub fn unassign(&self) {
+        self.inner.0.lock().unwrap().pending_group.take();
     }
 
-    /// Sets the `Workspace`'s coordinates.
-    pub fn set_coordinates(&self, coordinates: Vec<u32>) {
-        self.inner.0.lock().unwrap().set_coordinates(coordinates);
-    }
-
-    /// Gets the `Workspace`'s capabilities.
-    pub fn capabilities(&self) -> WorkspaceCapabilities {
-        self.inner.0.lock().unwrap().capabilities
-    }
-
-    /// Sets the `Workspace`'s capabilities.
-    pub fn set_capabilities(&mut self, capabilities: WorkspaceCapabilities) {
-        self.inner.0.lock().unwrap().set_capabilities(capabilities);
+    /// Access the workspace pending_group.
+    pub fn pending_group(&self) -> Option<WorkspaceGroup> {
+        self.inner.0
+            .lock()
+            .unwrap()
+            .pending_group
+            .as_ref()
+            .and_then(WeakWorkspaceGroup::upgrade)
     }
 
     /// Gets the `Workspace`'s group, if any.
@@ -246,23 +219,31 @@ impl Workspace {
 
         let mut inner = self.inner.0.lock().unwrap();
 
-        instance.name(inner.name.clone());
-        if let Some(id) = inner.id.clone() {
-            instance.id(id);
-        }
+        if !inner.current_state.name.is_empty() {
+            let state = &inner.current_state;
 
-        instance.state(inner.state);
-        instance.capabilities(inner.capabilities);
+            instance.name(state.name.clone());
+            if let Some(id) = inner.current_id.clone() {
+                instance.id(id);
+            }
 
-        if !inner.coordinates.is_empty() {
-            let coord: Vec<u8> = inner
-                .coordinates
-                .iter()
-                .copied()
-                .flat_map(u32::to_ne_bytes)
-                .collect();
+            instance.state(state.state);
+            instance.capabilities(state.capabilities);
 
-            instance.coordinates(coord);
+            if !state.coordinates.is_empty() {
+                let coord: Vec<u8> = state
+                    .coordinates
+                    .iter()
+                    .copied()
+                    .flat_map(u32::to_ne_bytes)
+                    .collect();
+
+                instance.coordinates(coord);
+            }
+
+            if let Some(group) = inner.group.as_ref().and_then(WeakWorkspaceGroup::upgrade) {
+                todo!();
+            }
         }
 
         inner.instances.push(instance);
@@ -302,92 +283,84 @@ impl Inner {
         })
     }
 
-    fn set_name(&mut self, name: String) {
-        if self.name != name {
-            self.name = name;
-
-            for instance in &self.instances {
-                instance.name(self.name.clone());
-            }
-
-            self.need_done()
-        }
-    }
-
     fn set_id(&mut self, id: String) -> bool {
-        if self.id.is_none() {
-            self.id = Some(id.clone());
-
-            for instance in &self.instances {
-                instance.id(id.clone());
-            }
-
-            self.need_done();
+        if self.current_id.is_none() {
+            self.pending_id = Some(id);
             true
         } else {
             false
         }
     }
 
-    fn set_coordinates(&mut self, coordinates: Vec<u32>) {
-        if self.coordinates != coordinates {
-            self.coordinates = coordinates;
+    fn apply_changes(&mut self) -> bool {
+        let name_changed = self.pending_state.name != self.current_state.name;
+        let coordinate_changed = self.pending_state.coordinates != self.current_state.coordinates;
+        let state_changed = self.pending_state.state != self.current_state.state;
+        let capabilities_changed = self.pending_state.capabilities != self.current_state.capabilities;
+        let group_changed = self.pending_group != self.group;
 
-            let coord: Vec<u8> = self
-                .coordinates
-                .iter()
-                .copied()
-                .flat_map(u32::to_ne_bytes)
-                .collect();
+        let changed = name_changed
+            | coordinate_changed
+            | state_changed
+            | capabilities_changed;
+
+        if changed {
+            self.current_state = self.pending_state.clone();
+        }
+
+        let id_changed = if let Some(id) = self.pending_id.take() {
+            self.current_id = Some(id);
+            true
+        } else {
+            false
+        };
+
+        let (old_group, new_group) = if group_changed {
+            let old_group = self.group.as_ref().and_then(WeakWorkspaceGroup::upgrade);
+            self.group = self.pending_group.clone();
+
+            (old_group, self.group.as_ref().and_then(WeakWorkspaceGroup::upgrade))
+        } else {
+            (None, None)
+        };
+
+        let changed = changed | id_changed | group_changed;
+
+        if changed {
+            let state = &self.current_state;
+            let new_coordinates = coordinate_changed.then(|| {
+                state.coordinates
+                    .iter()
+                    .copied()
+                    .flat_map(u32::to_ne_bytes)
+                    .collect()
+            });
+
+            let mut old_group = old_group.as_ref().map(|g| g.inner.0.lock().unwrap());
+            let mut new_group = new_group.as_ref().map(|g| g.inner.0.lock().unwrap());
 
             for instance in &self.instances {
-                instance.coordinates(coord.clone());
+                if name_changed { instance.name(state.name.clone()); }
+                if let Some(new_coord) = new_coordinates.clone() {
+                    instance.coordinates(new_coord);
+                }
+                if state_changed { instance.state(state.state); }
+                if capabilities_changed { instance.capabilities(state.capabilities); }
+                if id_changed {
+                    instance.id(self.current_id.clone().unwrap());
+                }
+
+                if let Some(old_group) = old_group.as_mut() {
+                    old_group.workspace_leave(&instance);
+                }
+
+                if let Some(new_group) = new_group.as_mut() {
+                    new_group.workspace_leave(&instance);
+                }
             }
         }
-    }
 
-    fn set_state(&mut self, new_state: State) {
-        if self.state != new_state {
-            self.state = new_state;
-
-            self.send_state();
-        }
-    }
-
-    fn set_state_flag(&mut self, flag: State, value: bool) {
-        if self.state.contains(flag) != value {
-            self.state.toggle(flag);
-
-            self.send_state();
-        }
-    }
-
-    fn set_capabilities(&mut self, capabilities: WorkspaceCapabilities) {
-        if self.capabilities != capabilities {
-            self.capabilities = capabilities;
-
-            for instance in &self.instances {
-                instance.capabilities(capabilities);
-            }
-
-            self.need_done();
-        }
-    }
-
-    #[inline]
-    fn send_state(&mut self) {
-        for instance in &self.instances {
-            instance.state(self.state);
-        }
-
-        self.need_done()
-    }
-
-    #[inline]
-    fn need_done(&mut self) {
-        if let Some(done_needed) = self.done_needed.as_mut() {
-            done_needed.store(true, Ordering::Release);
-        }
+        changed
     }
 }
 
@@ -407,7 +380,7 @@ impl WorkspaceManagerState {
         D: Dispatch<ExtWorkspaceHandleV1, WorkspaceData>,
         D: 'static,
     {
-        let handle = builder.build(self.instances.len(), self.done_needed.clone());
+        let handle = builder.build(self.instances.len());
 
         for instance in &self.instances {
             let Ok(client) = self.display.get_client(instance.id()) else {
@@ -418,11 +391,13 @@ impl WorkspaceManagerState {
         }
 
         self.workspaces.push(handle.clone());
-        self.done_needed.store(true, Ordering::Release);
         handle
     }
 
     /// Removes a [`Workspace`].
+    ///
+    /// This function marks the workspace for removal. The actual removal will take place when
+    /// [`WorkspaceManagerState::done()`] will be called.
     ///
     /// This function remove the `Workspace` from the manager, then send workspace_leave event on its active
     /// [`WorkspaceGroup`] if any. The instance list is then drained to avoid further requests, and
@@ -433,27 +408,44 @@ impl WorkspaceManagerState {
     /// after calling this function, the [`Workspace`] object will be functionally inert (it has no
     /// client instances, and none can be added back).
     pub fn remove_workspace(&mut self, workspace: Workspace) {
-        self.workspaces.retain(|w| w != &workspace);
-
-        if let Some(group) = workspace.group() {
-            group.workspace_leave(&workspace);
-        }
-
-        let mut inner = workspace.inner.0.lock().unwrap();
-
-        for instance in inner.instances.drain(..) {
-            instance.removed();
-        }
-
-        inner.done_needed.take();
-
-        self.done_needed.store(true, Ordering::Release);
+        workspace.inner.0.lock().unwrap().pending_removal = true;
     }
 
     /// Gets an iterator over managed [`Workspace`]
     pub fn workspaces(&self) -> std::slice::Iter<'_, Workspace> {
         self.workspaces.iter()
     }
+
+    /// Send all pending workspace changes.
+    ///
+    /// This function should be called after [`WorkspaceManager::send_groups_changes`]
+    pub fn send_workspaces_changes(&mut self) -> bool {
+        let mut changed = false;
+
+        self.workspaces.retain_mut(|w| {
+            let mut inner = w.inner.0.lock().unwrap();
+
+            if inner.pending_removal {
+                changed = true;
+
+                if let Some(group) = inner.group.take().and_then(|g| g.upgrade()) {
+                    //TODO: remove group.
+                }
+
+                for instance in inner.instances.drain(..) {
+                    instance.removed();
+                }
+
+                return false;
+            }
+
+            changed |= inner.apply_changes();
+            true
+        });
+
+        changed
+    }
+
 }
 
 impl<D> Dispatch2<ExtWorkspaceHandleV1, D> for WorkspaceData
@@ -477,7 +469,7 @@ where
             return;
         };
 
-        let capabilities = handle.capabilities();
+        let capabilities = handle.inner.0.lock().unwrap().current_state.capabilities;
 
         use ext_workspace_handle_v1::Request;
         let pending = match request {
@@ -549,39 +541,50 @@ impl Builder {
     /// Sets the coordinates to use on [`Workspace`] creation.
     pub fn with_coordinates(self, coordinates: impl Into<Vec<u32>>) -> Self {
         Self {
-            coordinates: coordinates.into(),
+            state: WorkspaceState {
+                coordinates: coordinates.into(),
+                ..self.state
+            },
             ..self
         }
     }
 
     /// Sets the [`Workspace`] initial state.
     pub fn with_state(self, state: State) -> Self {
-        Self { state, ..self }
+        Self {
+            state: WorkspaceState {
+                state,
+                ..self.state
+            },
+            ..self
+        }
     }
 
     /// Sets the [`Workspace`] initial capabilities.
     pub fn with_capabilities(self, capabilities: WorkspaceCapabilities) -> Self {
-        Self { capabilities, ..self }
+        Self {
+            state: WorkspaceState {
+                capabilities,
+                ..self.state
+            },
+            ..self
+        }
     }
 
-    fn build(self, capacity: usize, done_needed: Arc<AtomicBool>) -> Workspace {
-        let Self {
-            id,
-            name,
-            coordinates,
-            state,
-            capabilities,
-        } = self;
+    fn build(self, capacity: usize) -> Workspace {
+        let Self { state, id } = self;
         let inner = Arc::new((
             Mutex::new(Inner {
-                id,
-                name,
-                coordinates,
-                state,
-                capabilities,
+                pending_state: state,
+                current_state: Default::default(),
+                pending_id: id,
+                current_id: None,
+
+                pending_removal: false,
+
+                pending_group: None,
                 group: None,
                 instances: Vec::with_capacity(capacity),
-                done_needed: Some(done_needed),
             }),
             UserDataMap::default(),
         ));
@@ -633,5 +636,16 @@ impl PartialEq<Workspace> for WeakWorkspace {
     #[inline]
     fn eq(&self, other: &Workspace) -> bool {
         self.upgrade().map(|o| &o == other).unwrap_or(false)
+    }
+}
+
+impl Default for WorkspaceState {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            coordinates: Vec::new(),
+            state: State::empty(),
+            capabilities: WorkspaceCapabilities::all(),
+        }
     }
 }
